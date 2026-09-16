@@ -31,10 +31,11 @@ const (
 )
 
 func (h *HFresh) flatSearch(ctx context.Context, queryVector []float32, k int,
-	allowList helpers.AllowList,
+	allowList helpers.AllowList, stats *QueryStats,
 ) ([]uint64, []float32, error) {
 	aggregateMu := &sync.Mutex{}
 	results := priorityqueue.NewMax[any](k)
+	var statDistComps int
 
 	beforeIter := time.Now()
 	// first extract all candidates, this reduces the amount of coordination
@@ -67,6 +68,7 @@ func (h *HFresh) flatSearch(ctx context.Context, queryVector []float32, k int,
 			slice := h.tempVectors.Get(int(atomic.LoadUint32(&h.dims)))
 			defer h.tempVectors.Put(slice)
 			localResults := priorityqueue.NewMax[any](k)
+			localDistComps := 0
 			for idPos := workerID; idPos < len(candidates); idPos += flatSearchConcurrency {
 				candidate := candidates[idPos]
 
@@ -80,6 +82,7 @@ func (h *HFresh) flatSearch(ctx context.Context, queryVector []float32, k int,
 					}
 					return err
 				}
+				localDistComps++
 
 				addResult(localResults, candidate, dist, k)
 			}
@@ -89,6 +92,7 @@ func (h *HFresh) flatSearch(ctx context.Context, queryVector []float32, k int,
 
 			aggregateMu.Lock()
 			defer aggregateMu.Unlock()
+			statDistComps += localDistComps
 			for localResults.Len() > 0 {
 				res := localResults.Pop()
 				addResult(results, res.ID, res.Dist, k)
@@ -103,6 +107,16 @@ func (h *HFresh) flatSearch(ctx context.Context, queryVector []float32, k int,
 	}
 	took := time.Since(beforeIter)
 	helpers.AnnotateSlowQueryLog(ctx, "flat_search_iteration_took", took)
+
+	if stats != nil {
+		stats.FlatPath = true
+		stats.MembersScanned = len(candidates)
+		stats.PassingMembers = len(candidates)
+		stats.DistanceComps = statDistComps
+		// every scanned member is a full-precision fetch on this path
+		stats.RescoreFetches = statDistComps
+		stats.BytesRead = statDistComps * int(atomic.LoadUint32(&h.dims)) * 4
+	}
 
 	ids := make([]uint64, results.Len())
 	dists := make([]float32, results.Len())

@@ -45,7 +45,51 @@ const (
 	intermediateRescoreMinPool = 1024
 )
 
+// QueryStats collects per-query observability counters for the single-vector
+// search path. SearchByVectorWithStats resets the struct at entry and fills
+// it for that call only (safe to reuse one struct across queries);
+// SearchByVector passes nil. Byte counts reflect I/O shape (full posting
+// entries, including deleted and duplicate members), member counts reflect
+// scan work.
+type QueryStats struct {
+	// FlatPath is true when the query took the brute-force path over the
+	// allowlist instead of the centroid/posting path.
+	FlatPath bool
+	// PostingsRead is the number of non-nil postings fetched and scanned.
+	PostingsRead int
+	// BytesRead is the total posting-entry bytes scanned (id + version +
+	// quantized code per member, deleted/duplicate entries included: they
+	// are read either way). On the flat path it counts full-precision
+	// vector bytes fetched instead.
+	BytesRead int
+	// MembersScanned is the number of live, deduplicated posting members
+	// iterated (pre-filter). On the flat path it is the allowlist size.
+	MembersScanned int
+	// PassingMembers is the subset of MembersScanned that passed the
+	// allowlist (equal to MembersScanned when there is no filter).
+	PassingMembers int
+	// DistanceComps is the number of quantized distance computations in the
+	// scan stage (flat path: exact distance computations).
+	DistanceComps int
+	// RescoreFetches is the number of full-precision vector fetches in the
+	// rescore stage (flat path: every scanned member is such a fetch).
+	RescoreFetches int
+}
+
 func (h *HFresh) SearchByVector(ctx context.Context, vector []float32, k int, allowList helpers.AllowList) ([]uint64, []float32, error) {
+	return h.SearchByVectorWithStats(ctx, vector, k, allowList, nil)
+}
+
+// SearchByVectorWithStats is SearchByVector with optional per-query counters:
+// pass a non-nil stats to have it filled, nil for the plain search.
+func (h *HFresh) SearchByVectorWithStats(ctx context.Context, vector []float32, k int, allowList helpers.AllowList, stats *QueryStats) ([]uint64, []float32, error) {
+	// Overwrite semantics: the caller-owned struct is reset here so every
+	// field reflects exactly this call, even when the struct is reused
+	// across queries.
+	if stats != nil {
+		*stats = QueryStats{}
+	}
+
 	// Normalize before any search path to ensure consistent distance calculations
 	vector = h.normalizeVec(vector)
 
@@ -57,7 +101,7 @@ func (h *HFresh) SearchByVector(ctx context.Context, vector []float32, k int, al
 	}
 
 	if !h.muvera.Load() && allowList != nil && allowList.Len() < flatSearchCutoff {
-		return h.flatSearch(ctx, vector, k, allowList)
+		return h.flatSearch(ctx, vector, k, allowList, stats)
 	}
 
 	// The candidate pool must be at least as large as the requested k:
@@ -111,18 +155,21 @@ func (h *HFresh) SearchByVector(ctx context.Context, vector []float32, k int, al
 	defer h.visitedPool.Return(visited)
 
 	var decompressBuf []uint64
+	var postingsRead, bytesRead, membersScanned, passingMembers, distanceComps int
 
 	beforeScan := time.Now()
 	for i, p := range postings {
 		if p == nil { // posting nil if not found
 			continue
 		}
+		postingsRead++
 
 		// keep track of the posting size
 		postingSize := len(p)
 
 		for _, v := range p {
 			id := v.ID()
+			bytesRead += len(v)
 			// skip deleted vectors
 			deleted, err := h.VersionMap.IsDeleted(context.Background(), id)
 			if err != nil {
@@ -137,17 +184,20 @@ func (h *HFresh) SearchByVector(ctx context.Context, vector []float32, k int, al
 			if visited.CheckAndVisit(id) {
 				continue
 			}
+			membersScanned++
 
 			// skip vectors that are not in the allow list
 			if allowList != nil && !allowList.Contains(id) {
 				continue
 			}
+			passingMembers++
 
 			decompressBuf = quantizer.FromCompressedBytesInto(v.Data(), decompressBuf)
 			dist, err := queryDistancer.Distance(decompressBuf)
 			if err != nil {
 				return nil, nil, errors.Wrapf(err, "failed to compute distance for vector %d", id)
 			}
+			distanceComps++
 
 			q.Insert(id, dist)
 		}
@@ -163,6 +213,14 @@ func (h *HFresh) SearchByVector(ctx context.Context, vector []float32, k int, al
 	}
 	helpers.AnnotateSlowQueryLog(ctx, "hfresh_posting_scan_took", time.Since(beforeScan))
 
+	if stats != nil {
+		stats.PostingsRead = postingsRead
+		stats.BytesRead = bytesRead
+		stats.MembersScanned = membersScanned
+		stats.PassingMembers = passingMembers
+		stats.DistanceComps = distanceComps
+	}
+
 	if h.muvera.Load() {
 		ids := make([]uint64, 0, q.Len())
 		dists := make([]float32, 0, q.Len())
@@ -177,6 +235,9 @@ func (h *HFresh) SearchByVector(ctx context.Context, vector []float32, k int, al
 	candidates := make([]uint64, 0, q.Len())
 	for id := range q.Iter() {
 		candidates = append(candidates, id)
+	}
+	if stats != nil {
+		stats.RescoreFetches = len(candidates)
 	}
 
 	// Budget-aware fan-out: the context budget caps the worker count under

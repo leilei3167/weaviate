@@ -22,6 +22,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/weaviate/weaviate/adapters/repos/db/helpers"
 	"github.com/weaviate/weaviate/adapters/repos/db/vector/common"
+	"github.com/weaviate/weaviate/adapters/repos/db/vector/hnsw"
 	"github.com/weaviate/weaviate/adapters/repos/db/vector/hnsw/distancer"
 	"github.com/weaviate/weaviate/entities/concurrency"
 	enterrors "github.com/weaviate/weaviate/entities/errors"
@@ -74,6 +75,17 @@ type QueryStats struct {
 	// RescoreFetches is the number of full-precision vector fetches in the
 	// rescore stage (flat path: every scanned member is such a fetch).
 	RescoreFetches int
+	// CentroidDistanceComps counts layer-0 distance computations inside the
+	// centroid search (filtered searches only; summed across a lazy-deepen
+	// retry when one happens).
+	CentroidDistanceComps int
+	// CentroidCandidates is the length of the ranked centroid list the
+	// search had available for selection (pool depth actually reached).
+	CentroidCandidates int
+	// CentroidDeepRetries counts lazy-deepening re-searches: the evaluated
+	// pool was full but coverage dedup consumed it before the scan budget
+	// filled, so the search re-ran with a deepened beam.
+	CentroidDeepRetries int
 }
 
 func (h *HFresh) SearchByVector(ctx context.Context, vector []float32, k int, allowList helpers.AllowList) ([]uint64, []float32, error) {
@@ -82,10 +94,11 @@ func (h *HFresh) SearchByVector(ctx context.Context, vector []float32, k int, al
 
 // SearchByVectorWithStats is SearchByVector with optional per-query counters:
 // pass a non-nil stats to have it filled, nil for the plain search.
-func (h *HFresh) SearchByVectorWithStats(ctx context.Context, vector []float32, k int, allowList helpers.AllowList, stats *QueryStats) ([]uint64, []float32, error) {
+func (h *HFresh) SearchByVectorWithStats(ctx context.Context, vector []float32, k int, allow helpers.AllowList, stats *QueryStats) ([]uint64, []float32, error) {
 	// Overwrite semantics: the caller-owned struct is reset here so every
 	// field reflects exactly this call, even when the struct is reused
-	// across queries.
+	// across queries (internal accumulation, e.g. across a lazy retry,
+	// stays correct on top of the zeroed state).
 	if stats != nil {
 		*stats = QueryStats{}
 	}
@@ -100,8 +113,8 @@ func (h *HFresh) SearchByVectorWithStats(ctx context.Context, vector []float32, 
 		return nil, nil, nil
 	}
 
-	if !h.muvera.Load() && allowList != nil && allowList.Len() < flatSearchCutoff {
-		return h.flatSearch(ctx, vector, k, allowList, stats)
+	if !h.muvera.Load() && allow != nil && allow.Len() < flatSearchCutoff {
+		return h.flatSearch(ctx, vector, k, allow, stats)
 	}
 
 	// The candidate pool must be at least as large as the requested k:
@@ -121,26 +134,27 @@ func (h *HFresh) SearchByVectorWithStats(ctx context.Context, vector []float32, 
 	// to enlarge the search space.
 	candidateCentroidNum := max(k, int(atomic.LoadUint32(&h.searchProbe)))
 
-	nAllowList := allowList
-	if allowList != nil {
-		nAllowList = h.wrapAllowList(ctx, allowList)
-		defer nAllowList.Close()
-	}
-	beforeCentroids := time.Now()
-	centroids, err := h.Centroids.Search(vector, candidateCentroidNum, nAllowList)
-	helpers.AnnotateSlowQueryLog(ctx, "hfresh_centroid_search_took", time.Since(beforeCentroids))
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(centroids.data) == 0 {
-		return nil, nil, nil
-	}
-
+	var err error
 	q := NewResultSet(rescoreLimit)
 
-	selectedCentroids, err = h.selectCentroids(ctx, centroids, candidateCentroidNum)
+	if allow != nil {
+		wrapped := h.wrapAllowList(ctx, allow)
+		defer wrapped.Close()
+		selectedCentroids, err = h.searchFilteredCentroids(ctx, vector, candidateCentroidNum, wrapped, stats)
+	} else {
+		var centroids *ResultSet
+		beforeCentroids := time.Now()
+		centroids, err = h.Centroids.Search(vector, candidateCentroidNum, nil)
+		helpers.AnnotateSlowQueryLog(ctx, "hfresh_centroid_search_took", time.Since(beforeCentroids))
+		if err == nil && len(centroids.data) > 0 {
+			selectedCentroids, err = h.selectCentroids(ctx, centroids, candidateCentroidNum, nil)
+		}
+	}
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(selectedCentroids) == 0 {
+		return nil, nil, nil
 	}
 
 	// read all the selected postings
@@ -187,7 +201,7 @@ func (h *HFresh) SearchByVectorWithStats(ctx context.Context, vector []float32, 
 			membersScanned++
 
 			// skip vectors that are not in the allow list
-			if allowList != nil && !allowList.Contains(id) {
+			if allow != nil && !allow.Contains(id) {
 				continue
 			}
 			passingMembers++
@@ -564,11 +578,91 @@ func (h *HFresh) muveraSearchBudgets(k int) (routingBudget, rerankBudget int) {
 	return max(k, searchProbe), max(k, rescoreLimit)
 }
 
+// maxCentroidRetryK caps the lazy-deepening retry beam. 4096 is the deepest
+// centroid-search configuration the 10M wiki-dpr benchmark validated
+// (probe 512 x replicas 4 x 2), so the retry's worst-case cost stays in the
+// measured regime regardless of how replicas or searchProbe are configured.
+const maxCentroidRetryK = 4096
+
+// searchFilteredCentroids runs the filtered centroid stage shared by the
+// single-vector and MUVERA paths: a pool-overfetched candidate search
+// (poolK = budget x overfetchFactor — coverage dedup happens at selection,
+// AFTER the search capped its list, so redundant candidates must be
+// replaceable from a deeper ranked list or filtered searches would scan
+// fewer than budget distinct postings), ranked selection with coverage
+// dedup, and at most one lazy deepening retry. Returns the selected posting
+// IDs (empty when nothing qualifies). stats is optional and nil-safe.
+func (h *HFresh) searchFilteredCentroids(ctx context.Context, vector []float32, budget int, wrapped *allowList, stats *QueryStats) ([]uint64, error) {
+	poolK := int(float64(budget)*h.overfetchFactor + 0.5)
+
+	beforeCentroids := time.Now()
+	centroids, cstats, err := h.Centroids.SearchWithPool(ctx, vector, budget, poolK, wrapped)
+	helpers.AnnotateSlowQueryLog(ctx, "hfresh_centroid_search_took", time.Since(beforeCentroids))
+	if err != nil {
+		return nil, err
+	}
+	if stats != nil {
+		stats.CentroidDistanceComps += cstats.DistanceComps
+		stats.CentroidCandidates = cstats.PoolSize
+	}
+	if len(centroids.data) == 0 {
+		return nil, nil
+	}
+
+	selected, err := h.selectCentroids(ctx, centroids, budget, wrapped)
+	if err != nil {
+		return nil, err
+	}
+
+	// Lazy deepening, at most once. Two shortfall causes justify a deeper
+	// beam:
+	//   - the pool came back full: coverage dedup consumed >= poolK ranked
+	//     candidates before the budget filled, so deeper ones likely exist;
+	//   - capture was inactive (RRE fallback on a nil-entrypoint race, or
+	//     poolK <= ef): a short list then says NOTHING about the graph.
+	// A short pool WITH capture active means the beam genuinely evaluated
+	// few allowed candidates; a deeper beam might still reach more, but the
+	// 10M benchmark measured that case benign, so it deliberately gets no
+	// retry — searchProbe is the lever for more routing exploration.
+	if len(selected) < budget && (centroids.Len() >= poolK || !cstats.CaptureActive) {
+		// poolK already embeds the replica factor, so one doubling is a
+		// genuine deepening; when the clamp leaves no headroom the retry is
+		// pointless and skipped.
+		retryK := min(2*poolK, maxCentroidRetryK)
+		if retryK > poolK {
+			wrapped.resetClaims()
+			var rstats hnsw.PoolSearchStats
+			centroids, rstats, err = h.Centroids.SearchWithPool(ctx, vector, retryK, retryK, wrapped)
+			if err != nil {
+				return nil, err
+			}
+			if stats != nil {
+				stats.CentroidDistanceComps += rstats.DistanceComps
+				stats.CentroidCandidates = rstats.PoolSize
+				stats.CentroidDeepRetries++
+			}
+			if len(centroids.data) > 0 {
+				selected, err = h.selectCentroids(ctx, centroids, budget, wrapped)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	return selected, nil
+}
+
 // selectCentroids filters a centroid search result down to the candidates
 // worth scanning: it drops centroids beyond MaxDistanceRatio of the best
 // match (when past the pruning floor) and centroids whose posting is empty,
 // keeping at most budget survivors in ranked order.
-func (h *HFresh) selectCentroids(ctx context.Context, centroids *ResultSet, budget int) ([]uint64, error) {
+//
+// With a filter, coverage dedup also happens here, in ranked order: a
+// posting whose allowed members are all covered by better-ranked selected
+// postings is redundant and skipped (wrapped.selectPosting). Doing this at
+// selection time — rather than at probe time inside the centroid search —
+// keeps the outcome independent of probe/traversal order.
+func (h *HFresh) selectCentroids(ctx context.Context, centroids *ResultSet, budget int, wrapped *allowList) ([]uint64, error) {
 	maxDist := centroids.data[0].Distance * h.config.MaxDistanceRatio
 
 	selected := make([]uint64, 0, budget)
@@ -581,6 +675,9 @@ func (h *HFresh) selectCentroids(ctx context.Context, centroids *ResultSet, budg
 			return nil, err
 		}
 		if count == 0 {
+			continue
+		}
+		if wrapped != nil && !wrapped.selectPosting(centroids.data[i].ID) {
 			continue
 		}
 		selected = append(selected, centroids.data[i].ID)
@@ -604,7 +701,7 @@ func (h *HFresh) searchByFDE(
 	queryFDE []float32,
 	routingBudget int,
 	rerankBudget int,
-	allowList helpers.AllowList,
+	allow helpers.AllowList,
 ) ([]uint64, error) {
 	queryFDE = h.normalizeVec(queryFDE)
 	// loadQuantizer's atomic dims read pairs with the store that publishes
@@ -615,25 +712,31 @@ func (h *HFresh) searchByFDE(
 	}
 	queryDistancer := quantizer.NewDistancer(queryFDE)
 
-	// Step 1: Centroid selection - controlled by routingBudget only
-	nAllowList := allowList
-	if allowList != nil {
-		nAllowList = h.wrapAllowList(ctx, allowList)
-		defer nAllowList.Close()
+	// Steps 1+2: centroid search and selection - controlled by
+	// routingBudget only. Filtered searches share the pool-overfetch +
+	// selection + lazy-deepening protocol with the single-vector path
+	// (searchFilteredCentroids); MUVERA has no QueryStats surface, so the
+	// helper's stats are discarded via nil.
+	var selectedCentroids []uint64
+	var err error
+	if allow != nil {
+		wrapped := h.wrapAllowList(ctx, allow)
+		defer wrapped.Close()
+		selectedCentroids, err = h.searchFilteredCentroids(ctx, queryFDE, routingBudget, wrapped, nil)
+	} else {
+		var centroids *ResultSet
+		beforeCentroids := time.Now()
+		centroids, err = h.Centroids.Search(queryFDE, routingBudget, nil)
+		helpers.AnnotateSlowQueryLog(ctx, "hfresh_centroid_search_took", time.Since(beforeCentroids))
+		if err == nil && len(centroids.data) > 0 {
+			selectedCentroids, err = h.selectCentroids(ctx, centroids, routingBudget, nil)
+		}
 	}
-
-	centroids, err := h.Centroids.Search(queryFDE, routingBudget, nAllowList)
 	if err != nil {
 		return nil, err
 	}
-	if len(centroids.data) == 0 {
+	if len(selectedCentroids) == 0 {
 		return nil, nil
-	}
-
-	// Step 2: Filter centroids by distance and posting existence
-	selectedCentroids, err := h.selectCentroids(ctx, centroids, routingBudget)
-	if err != nil {
-		return nil, err
 	}
 
 	// Step 3: Scan postings from selected centroids
@@ -682,7 +785,7 @@ func (h *HFresh) searchByFDE(
 				continue
 			}
 
-			if allowList != nil && !allowList.Contains(id) {
+			if allow != nil && !allow.Contains(id) {
 				continue
 			}
 

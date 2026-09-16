@@ -240,11 +240,50 @@ func (h *hnsw) searchLayerByVectorWithDistancer(ctx context.Context,
 	return h.searchLayerByVectorWithDistancerWithStrategy(ctx, queryVector, entrypoints, ef, level, allowList, compressorDistancer, SWEEPING)
 }
 
+// layerCandidatePool collects, when non-nil, the layer-0 ACORN candidates
+// whose distances were computed but who fell out of the ef-bounded result
+// heap: neighbors rejected by the worst-result gate and nodes popped when
+// the heap overflowed. Every entry already paid its distance computation —
+// capturing them widens the returned ranked list without deepening the beam
+// or changing termination. overflow is a max-heap capped at cap, so only
+// the best cap discards are kept; a nil overflow puts the pool in
+// comps-only mode (capture would be dead work, e.g. poolK <= ef, or the
+// strategy never discards evaluated allowed candidates). comps counts
+// layer-0 batch distance computations for observability.
+type layerCandidatePool struct {
+	overflow *priorityqueue.Queue[any]
+	cap      int
+	comps    int
+}
+
+func (p *layerCandidatePool) add(id uint64, dist float32) {
+	p.overflow.Insert(id, dist)
+	if p.overflow.Len() > p.cap {
+		p.overflow.Pop()
+	}
+}
+
+// capturing reports whether discard capture is armed (as opposed to
+// comps-only mode).
+func (p *layerCandidatePool) capturing() bool {
+	return p != nil && p.overflow != nil
+}
+
 func (h *hnsw) searchLayerByVectorWithDistancerWithStrategy(ctx context.Context,
 	queryVector []float32,
 	entrypoints *priorityqueue.Queue[any], ef int, level int,
 	allowList helpers.AllowList, compressorDistancer compressionhelpers.CompressorDistancer,
 	strategy FilterStrategy) (*priorityqueue.Queue[any], error,
+) {
+	return h.searchLayerByVectorWithDistancerWithStrategyAndPool(ctx, queryVector, entrypoints, ef, level, allowList, compressorDistancer, strategy, nil)
+}
+
+func (h *hnsw) searchLayerByVectorWithDistancerWithStrategyAndPool(ctx context.Context,
+	queryVector []float32,
+	entrypoints *priorityqueue.Queue[any], ef int, level int,
+	allowList helpers.AllowList, compressorDistancer compressionhelpers.CompressorDistancer,
+	strategy FilterStrategy, pool *layerCandidatePool,
+) (*priorityqueue.Queue[any], error,
 ) {
 	start := time.Now()
 	defer func() {
@@ -333,6 +372,12 @@ func (h *hnsw) searchLayerByVectorWithDistancerWithStrategy(ctx context.Context,
 			prefilterFullAt = al
 		}
 	}
+
+	// Discard capture is only sound under ACORN, where every evaluated
+	// neighbor is a known-allowed candidate. A non-nil pool only enters via
+	// the level-0 call in knnSearchByVectorWithPool, so no level check is
+	// needed.
+	captureDiscards := pool.capturing() && strategy == ACORN
 
 	for candidates.Len() > 0 {
 		if err := ctx.Err(); err != nil {
@@ -643,6 +688,9 @@ func (h *hnsw) searchLayerByVectorWithDistancerWithStrategy(ctx context.Context,
 		}
 		neighborDists := distSlice.Slice[:len(unvisited)]
 		neighborErrs := batchDistancer.DistancesToNodes(unvisited, neighborDists)
+		if pool != nil {
+			pool.comps += len(unvisited)
+		}
 
 		for i, neighborID := range unvisited {
 			distance := neighborDists[i]
@@ -692,12 +740,25 @@ func (h *hnsw) searchLayerByVectorWithDistancerWithStrategy(ctx context.Context,
 
 				// +1 because we have added one node size calculating the len
 				if results.Len() > ef {
-					results.Pop()
+					popped := results.Pop()
+					// the popped node's distance is paid and it survived the
+					// tombstone check above: keep it for the deeper list
+					if captureDiscards {
+						pool.add(popped.ID, popped.Dist)
+					}
 				}
 
 				if results.Len() > 0 {
 					worstResultDistance = results.Top().Dist
 				}
+			} else if captureDiscards && !h.hasTombstone(neighborID) {
+				// evaluated but out of the beam: under ACORN the node is a
+				// known-allowed candidate whose distance is already paid —
+				// keep it for the caller's deeper ranked list. Tombstoned
+				// nodes are excluded here so they cannot evict live
+				// candidates from the capped pool (the merge re-checks as a
+				// backstop against races).
+				pool.add(neighborID, distance)
 			}
 		}
 	}
@@ -1004,8 +1065,73 @@ func (h *hnsw) entrypointDistWithRepair(ctx context.Context,
 	}
 }
 
+// PoolSearchStats reports observability counters from a pool search: how
+// many layer-0 distance computations the search performed, how deep the
+// returned ranked list actually is, and whether beyond-beam depth was
+// actually available.
+type PoolSearchStats struct {
+	DistanceComps int
+	PoolSize      int
+	// CaptureActive reports whether the search could deliver depth beyond
+	// its beam: true on the ACORN graph path with discard capture armed,
+	// and on the flat path (which ranks every allowed candidate, so its
+	// depth is exhaustive up to poolK). When false — the strategy silently
+	// degraded (e.g. the RRE nil-entrypoint fallback), or capture was
+	// skipped because poolK <= ef — a short result list says NOTHING about
+	// the graph: deeper candidates may exist that only a wider search can
+	// reach. Callers gating "should I search deeper?" decisions on
+	// PoolSize must treat CaptureActive == false as inconclusive.
+	CaptureActive bool
+}
+
+// SearchByVectorWithPool behaves like SearchByVector but returns up to poolK
+// ranked results while running the search with the beam width and
+// termination of a k-sized search: the extra results come from candidates
+// the search already evaluated (and would otherwise discard), so the
+// distance-computation cost is that of the k-search. Beyond-ef depth is only
+// captured on the ACORN strategy (the HFresh centroid use case); other
+// strategies still return up to min(ef, poolK) from the result heap, with
+// stats.CaptureActive reporting the difference. The flat path ranks every
+// allowed candidate and returns top-poolK exactly.
+func (h *hnsw) SearchByVectorWithPool(ctx context.Context, vector []float32,
+	k, poolK int, allowList helpers.AllowList,
+) ([]uint64, []float32, PoolSearchStats, error) {
+	var stats PoolSearchStats
+	if poolK < k {
+		poolK = k
+	}
+	h.compressActionLock.RLock()
+	defer h.compressActionLock.RUnlock()
+
+	vector = h.normalizeVec(vector)
+	flatSearchCutoff := int(atomic.LoadInt64(&h.flatSearchCutoff))
+	if allowList != nil && !h.forbidFlat && allowList.Len() < flatSearchCutoff {
+		helpers.AnnotateSlowQueryLog(ctx, "hnsw_flat_search", true)
+		// the pre-rescore heap must hold at least poolK candidates: with
+		// rescoring enabled flatSearch caps the heap at the limit param,
+		// and searchTimeEF alone can sit below poolK
+		ids, dists, err := h.flatSearch(ctx, vector, poolK, max(poolK, h.searchTimeEF(k)), allowList)
+		stats.PoolSize = len(ids)
+		stats.CaptureActive = true
+		return ids, dists, stats, err
+	}
+	helpers.AnnotateSlowQueryLog(ctx, "hnsw_flat_search", false)
+	ids, dists, err := h.knnSearchByVectorWithPool(ctx, vector, k, poolK, h.searchTimeEF(k), allowList, &stats)
+	return ids, dists, stats, err
+}
+
 func (h *hnsw) knnSearchByVector(ctx context.Context, searchVec []float32, k int,
 	ef int, allowList helpers.AllowList,
+) ([]uint64, []float32, error) {
+	return h.knnSearchByVectorWithPool(ctx, searchVec, k, k, ef, allowList, nil)
+}
+
+// knnSearchByVectorWithPool is knnSearchByVector generalized to return up to
+// poolK results from the search's evaluated-candidate pool (see
+// SearchByVectorWithPool). poolK == k with a nil stats reproduces the plain
+// search exactly.
+func (h *hnsw) knnSearchByVectorWithPool(ctx context.Context, searchVec []float32, k int,
+	poolK int, ef int, allowList helpers.AllowList, stats *PoolSearchStats,
 ) ([]uint64, []float32, error) {
 	if h.isEmpty() {
 		return nil, nil, nil
@@ -1177,14 +1303,52 @@ func (h *hnsw) knnSearchByVector(ctx context.Context, searchVec []float32, k int
 		}
 		h.shardedNodeLocks.RUnlockAll()
 	}
-	res, err := h.searchLayerByVectorWithDistancerWithStrategy(ctx, searchVec, eps, ef, 0, allowList, compressorDistancer, strategy)
+	var pool *layerCandidatePool
+	if stats != nil {
+		pool = &layerCandidatePool{}
+		// Capture is armed only when it can matter: with poolK <= ef every
+		// discard provably ranks at or below the final heap's worst (the
+		// worst-result gate is monotone once the ef-heap is full), so the
+		// merge could never change the result — skip the heap entirely.
+		// Capture only fires under ACORN anyway (see captureDiscards).
+		if poolK > ef && strategy == ACORN {
+			pool.overflow = h.pools.pqResults.GetMax(poolK)
+			pool.cap = poolK
+		}
+		stats.CaptureActive = pool.capturing()
+	}
+	res, err := h.searchLayerByVectorWithDistancerWithStrategyAndPool(ctx, searchVec, eps, ef, 0, allowList, compressorDistancer, strategy, pool)
 	if err != nil {
+		if pool.capturing() {
+			h.pools.pqResults.Put(pool.overflow)
+		}
 		return nil, nil, errors.Wrapf(err, "knn search: search layer at level %d", 0)
+	}
+
+	if pool != nil {
+		if pool.capturing() {
+			// merge the evaluated-but-discarded candidates back in and keep
+			// the best poolK; capture excludes tombstoned nodes, the
+			// re-check here is a backstop against tombstones added since
+			for pool.overflow.Len() > 0 {
+				item := pool.overflow.Pop()
+				if h.hasTombstone(item.ID) {
+					continue
+				}
+				res.Insert(item.ID, item.Dist)
+				if res.Len() > poolK {
+					res.Pop()
+				}
+			}
+			h.pools.pqResults.Put(pool.overflow)
+			pool.overflow = nil
+		}
+		stats.DistanceComps = pool.comps
 	}
 
 	beforeRescore := time.Now()
 	if h.shouldRescore() && !h.multivector.Load() {
-		if err := h.rescore(ctx, res, k, compressorDistancer); err != nil {
+		if err := h.rescore(ctx, res, poolK, compressorDistancer); err != nil {
 			helpers.AnnotateSlowQueryLog(ctx, "context_error", "knn_search_rescore")
 			took := time.Since(beforeRescore)
 			helpers.AnnotateSlowQueryLog(ctx, "knn_search_rescore_took", took)
@@ -1195,9 +1359,12 @@ func (h *hnsw) knnSearchByVector(ctx context.Context, searchVec []float32, k int
 	}
 
 	if !h.multivector.Load() {
-		for res.Len() > k {
+		for res.Len() > poolK {
 			res.Pop()
 		}
+	}
+	if stats != nil {
+		stats.PoolSize = res.Len()
 	}
 	ids := make([]uint64, res.Len())
 	dists := make([]float32, res.Len())

@@ -147,7 +147,7 @@ func (ih *InstrumentedHFresh) searchByFDEInstrumented(
 	}
 
 	// Filter centroids (same production step as searchByFDE)
-	selectedCentroids, err := h.selectCentroids(ctx, centroids, routingBudget)
+	selectedCentroids, err := h.selectCentroids(ctx, centroids, routingBudget, nil)
 	if err != nil {
 		return nil, err
 	}

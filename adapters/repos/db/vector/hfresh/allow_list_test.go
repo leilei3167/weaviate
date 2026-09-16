@@ -171,6 +171,52 @@ func TestPostingPassesFilterSlice_CachesAcceptedPostingID(t *testing.T) {
 	hfAllowList.Close()
 }
 
+// TestSelectPostingClaimsAllAllowedAndSkipsRedundant covers the
+// selection-time coverage dedup: selecting a posting claims ALL its allowed
+// members, a posting whose allowed members are all claimed is redundant, and
+// probe-time Contains stays pure (unaffected by claims).
+func TestSelectPostingClaimsAllAllowedAndSkipsRedundant(t *testing.T) {
+	store := testinghelpers.NewDummyStore(t)
+	bucket, err := NewSharedBucket(store, "test", StoreConfig{MakeBucketOptions: lsmkv.MakeNoopBucketOptions})
+	require.NoError(t, err)
+	pm := NewPostingMap(bucket)
+	ctx := t.Context()
+
+	// posting 0 has allowed vectors [0, 1]; posting 1 only has [1] (a
+	// replica); posting 2 has [2]
+	pm.FastAddVectorID(ctx, 0, 0)
+	pm.FastAddVectorID(ctx, 0, 1)
+	pm.FastAddVectorID(ctx, 1, 1)
+	pm.FastAddVectorID(ctx, 2, 2)
+
+	hf := &HFresh{
+		visitedPool: visited.NewPool(10),
+		PostingMap:  pm,
+	}
+
+	allowList := helpers.NewAllowList(0, 1, 2)
+	wrapped := hf.wrapAllowList(ctx, allowList)
+	defer wrapped.Close()
+
+	// probe-time Contains is pure: every posting with an allowed member
+	// answers true, in any order, any number of times
+	require.True(t, wrapped.Contains(0))
+	require.True(t, wrapped.Contains(1))
+	require.True(t, wrapped.Contains(2))
+
+	// selecting posting 0 claims BOTH 0 and 1
+	require.True(t, wrapped.selectPosting(0))
+
+	// claims must not leak into the pure probe check
+	require.True(t, wrapped.Contains(1))
+
+	// posting 1 only replicates already-claimed vector 1: redundant
+	require.False(t, wrapped.selectPosting(1))
+
+	// posting 2 contributes vector 2: selected
+	require.True(t, wrapped.selectPosting(2))
+}
+
 func TestAllowListIteratorReturnsAcceptedPostingWithSingleAllowedVector(t *testing.T) {
 	store := testinghelpers.NewDummyStore(t)
 	bucket, err := NewSharedBucket(store, "test", StoreConfig{MakeBucketOptions: lsmkv.MakeNoopBucketOptions})

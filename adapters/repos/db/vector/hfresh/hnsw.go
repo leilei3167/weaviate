@@ -154,6 +154,28 @@ func (i *HNSWIndex) Search(query []float32, k int, allowList helpers.AllowList) 
 	return &ResultSet{data: results}, nil
 }
 
+// SearchWithPool returns up to poolK ranked centroids at the search cost of
+// a k-sized search: the extra depth comes from candidates the underlying
+// ACORN search already evaluated (see hnsw.SearchByVectorWithPool). Used by
+// filtered searches so selection-time coverage dedup can backfill redundant
+// postings without deepening the beam.
+func (i *HNSWIndex) SearchWithPool(ctx context.Context, query []float32, k, poolK int, allowList helpers.AllowList) (*ResultSet, hnsw.PoolSearchStats, error) {
+	start := time.Now()
+	defer i.metrics.CentroidSearchDuration(start)
+
+	ids, distances, stats, err := i.hnsw.SearchByVectorWithPool(ctx, query, k, poolK, allowList)
+	if err != nil {
+		return nil, stats, err
+	}
+
+	results := make([]Result, len(ids))
+	for i := range ids {
+		results[i] = Result{ID: ids[i], Distance: distances[i]}
+	}
+
+	return &ResultSet{data: results}, stats, nil
+}
+
 func (i *HNSWIndex) GetMaxID() uint64 {
 	return i.hnsw.CurrentVectorsLen()
 }

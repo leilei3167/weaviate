@@ -36,6 +36,13 @@ import (
 	ent "github.com/weaviate/weaviate/entities/vectorindex/hfresh"
 )
 
+// centroidOverfetchFactor resolves the filtered-search pool factor: the
+// replication factor (each vector lives in ~replicas postings, bounding
+// replica redundancy in a ranked prefix).
+func centroidOverfetchFactor(replicas uint32) float64 {
+	return float64(max(1, replicas))
+}
+
 const (
 	DefaultRNGFactor = 10.0
 )
@@ -66,6 +73,11 @@ type HFresh struct {
 	searchProbe      uint32
 	rescoreLimit     uint32
 	store            *lsmkv.Store
+	// overfetchFactor scales the centroid-candidate pool requested for
+	// filtered searches (poolK = probe budget x factor) so that
+	// selection-time coverage dedup can backfill redundant postings.
+	// Defaults to the replication factor.
+	overfetchFactor float64
 
 	// needsNormalization is precomputed at construction from the configured
 	// distance: cosine-dot only equals the cosine distance on unit vectors,
@@ -166,6 +178,7 @@ func New(cfg *Config, uc ent.UserConfig, store *lsmkv.Store) (*HFresh, error) {
 		maxPostingSizeKB:   uc.MaxPostingSizeKB,
 		replicas:           uc.Replicas,
 		rngFactor:          DefaultRNGFactor,
+		overfetchFactor:    centroidOverfetchFactor(uc.Replicas),
 		searchProbe:        uc.SearchProbe,
 		rescoreLimit:       uint32(uc.RQ.RescoreLimit),
 		rootPath:           cfg.RootPath,

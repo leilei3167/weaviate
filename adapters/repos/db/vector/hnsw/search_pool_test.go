@@ -126,6 +126,56 @@ func TestSearchByVectorWithPoolFlatRescore(t *testing.T) {
 	}
 }
 
+// TestSearchByVectorWithPoolEntrypointSeedDuplicate reproduces the
+// duplicate-entrypoint hazard: on the ACORN path the allow-list seed loop
+// can enqueue the global entrypoint a second time (the descent already
+// contributed it), and insertViableEntrypointsAsCandidatesAndResults must
+// not insert both occurrences into the result heap — one copy would stay in
+// the beam while the other is popped into the discard pool, and the merge
+// would return the same id twice while burning a poolK slot. Two
+// ingredients make the double-seeding deterministic regardless of which
+// node the (randomly leveled) graph elected as entrypoint: the query IS the
+// entrypoint's own vector, so the per-level descent can never improve on it
+// (distance 0) and the global entrypoint survives to level 0; and the
+// allowlist is exactly {entrypoint}, so the seed loop re-enqueues it.
+func TestSearchByVectorWithPoolEntrypointSeedDuplicate(t *testing.T) {
+	const (
+		n     = 300
+		k     = 2
+		ef    = 8
+		poolK = 10
+	)
+
+	ctx := context.Background()
+	vectors, _ := testinghelpers.RandomVecsFixedSeed(n, 1, 8)
+
+	index := newPoolTestIndex(t, ent.UserConfig{
+		MaxConnections:        16,
+		EFConstruction:        32,
+		EF:                    ef,
+		VectorCacheMaxObjects: 100000,
+		FilterStrategy:        ent.FilterStrategyAcorn,
+		FlatSearchCutoff:      1, // force the graph path
+	}, vectors)
+
+	ep := index.entryPointID
+	query := vectors[ep]
+	allow := helpers.NewAllowList(ep)
+	defer allow.Close()
+
+	poolIDs, _, stats, err := index.SearchByVectorWithPool(ctx, query, k, poolK, allow)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{ep}, poolIDs,
+		"the doubly-seeded entrypoint must appear exactly once in the pooled output")
+	require.Equal(t, 1, stats.PoolSize)
+
+	// the plain path shares the entrypoint seeding and must dedup too
+	plainIDs, _, err := index.SearchByVector(ctx, query, k, allow)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{ep}, plainIDs,
+		"the plain search must not return the doubly-seeded entrypoint twice")
+}
+
 // TestSearchByVectorWithPool pins the pool-reuse contract on the ACORN path:
 // the deeper ranked list is served from candidates the k-search already
 // evaluated, WITHOUT touching the beam or its termination. Two properties

@@ -240,33 +240,94 @@ func (h *hnsw) searchLayerByVectorWithDistancer(ctx context.Context,
 	return h.searchLayerByVectorWithDistancerWithStrategy(ctx, queryVector, entrypoints, ef, level, allowList, compressorDistancer, SWEEPING)
 }
 
+// poolItem is one captured candidate. Ranking is by (distance, id): the id
+// tie-break makes pool retention and the returned ranked list deterministic
+// when distances tie, which the centroid index's 8-bit RQ distances do for
+// ~0.1% of candidates on the 10M benchmark — enough that heap-arbitrary tie
+// order would leak capture order into downstream coverage claims.
+type poolItem struct {
+	id   uint64
+	dist float32
+}
+
+// worseThan reports whether a ranks strictly after b in (distance, id)
+// order.
+func (a poolItem) worseThan(b poolItem) bool {
+	if a.dist != b.dist {
+		return a.dist > b.dist
+	}
+	return a.id > b.id
+}
+
+// poolItemSlices recycles capture buffers across queries; the backing array
+// grows to the largest poolK seen and stays pooled.
+var poolItemSlices = sync.Pool{
+	New: func() any {
+		s := make([]poolItem, 0, 1024)
+		return &s
+	},
+}
+
 // layerCandidatePool collects, when non-nil, the layer-0 ACORN candidates
 // whose distances were computed but who fell out of the ef-bounded result
 // heap: neighbors rejected by the worst-result gate and nodes popped when
 // the heap overflowed. Every entry already paid its distance computation —
 // capturing them widens the returned ranked list without deepening the beam
-// or changing termination. overflow is a max-heap capped at cap, so only
-// the best cap discards are kept; a nil overflow puts the pool in
-// comps-only mode (capture would be dead work, e.g. poolK <= ef, or the
-// strategy never discards evaluated allowed candidates). comps counts
-// layer-0 batch distance computations for observability.
+// or changing termination. overflow is a (distance, id) max-heap capped at
+// cap, so exactly the best cap discards are kept deterministically; cap ==
+// 0 puts the pool in comps-only mode (capture would be dead work, e.g.
+// poolK <= ef, or the strategy never discards evaluated allowed
+// candidates). comps counts layer-0 batch distance computations for
+// observability.
 type layerCandidatePool struct {
-	overflow *priorityqueue.Queue[any]
+	overflow []poolItem
 	cap      int
 	comps    int
 }
 
 func (p *layerCandidatePool) add(id uint64, dist float32) {
-	p.overflow.Insert(id, dist)
-	if p.overflow.Len() > p.cap {
-		p.overflow.Pop()
+	it := poolItem{id: id, dist: dist}
+	if len(p.overflow) < p.cap {
+		// push + sift up
+		p.overflow = append(p.overflow, it)
+		i := len(p.overflow) - 1
+		for i > 0 {
+			parent := (i - 1) / 2
+			if !p.overflow[i].worseThan(p.overflow[parent]) {
+				break
+			}
+			p.overflow[i], p.overflow[parent] = p.overflow[parent], p.overflow[i]
+			i = parent
+		}
+		return
+	}
+	// full: the root is the worst retained item; keep the newcomer only if
+	// it ranks strictly before the root, then sift the replacement down
+	if !p.overflow[0].worseThan(it) {
+		return
+	}
+	p.overflow[0] = it
+	i := 0
+	for {
+		worst := i
+		if l := 2*i + 1; l < len(p.overflow) && p.overflow[l].worseThan(p.overflow[worst]) {
+			worst = l
+		}
+		if r := 2*i + 2; r < len(p.overflow) && p.overflow[r].worseThan(p.overflow[worst]) {
+			worst = r
+		}
+		if worst == i {
+			return
+		}
+		p.overflow[i], p.overflow[worst] = p.overflow[worst], p.overflow[i]
+		i = worst
 	}
 }
 
 // capturing reports whether discard capture is armed (as opposed to
 // comps-only mode).
 func (p *layerCandidatePool) capturing() bool {
-	return p != nil && p.overflow != nil
+	return p != nil && p.cap > 0
 }
 
 func (h *hnsw) searchLayerByVectorWithDistancerWithStrategy(ctx context.Context,
@@ -1315,45 +1376,48 @@ func (h *hnsw) knnSearchByVectorWithPool(ctx context.Context, searchVec []float3
 		// Capture is armed only when it can matter: with poolK <= ef every
 		// discard provably ranks at or below the final heap's worst (the
 		// worst-result gate is monotone once the ef-heap is full), so the
-		// merge could never change the result — skip the heap entirely.
+		// merge could never change the result — skip the buffer entirely.
 		// Capture only fires under ACORN anyway (see captureDiscards).
 		if poolK > ef && strategy == ACORN {
-			pool.overflow = h.pools.pqResults.GetMax(poolK)
+			buf := poolItemSlices.Get().(*[]poolItem)
+			pool.overflow = (*buf)[:0]
 			pool.cap = poolK
+			defer func() {
+				*buf = pool.overflow[:0]
+				poolItemSlices.Put(buf)
+			}()
 		}
 		stats.CaptureActive = pool.capturing()
 	}
 	res, err := h.searchLayerByVectorWithDistancerWithStrategyAndPool(ctx, searchVec, eps, ef, 0, allowList, compressorDistancer, strategy, pool)
 	if err != nil {
-		if pool.capturing() {
-			h.pools.pqResults.Put(pool.overflow)
-		}
 		return nil, nil, errors.Wrapf(err, "knn search: search layer at level %d", 0)
 	}
 
+	captured := []poolItem(nil)
 	if pool != nil {
-		if pool.capturing() {
-			// merge the evaluated-but-discarded candidates back in and keep
-			// the best poolK; capture excludes tombstoned nodes, the
+		captured = pool.overflow
+		stats.DistanceComps = pool.comps
+	}
+
+	rescoring := h.shouldRescore() && !h.multivector.Load()
+	if rescoring {
+		if len(captured) > 0 {
+			// merge captured discards before rescoring so they get exact
+			// distances too; capture excludes tombstoned nodes, the
 			// re-check here is a backstop against tombstones added since
-			for pool.overflow.Len() > 0 {
-				item := pool.overflow.Pop()
-				if h.hasTombstone(item.ID) {
+			for _, item := range captured {
+				if h.hasTombstone(item.id) {
 					continue
 				}
-				res.Insert(item.ID, item.Dist)
+				res.Insert(item.id, item.dist)
 				if res.Len() > poolK {
 					res.Pop()
 				}
 			}
-			h.pools.pqResults.Put(pool.overflow)
-			pool.overflow = nil
+			captured = nil
 		}
-		stats.DistanceComps = pool.comps
-	}
-
-	beforeRescore := time.Now()
-	if h.shouldRescore() && !h.multivector.Load() {
+		beforeRescore := time.Now()
 		if err := h.rescore(ctx, res, poolK, compressorDistancer); err != nil {
 			helpers.AnnotateSlowQueryLog(ctx, "context_error", "knn_search_rescore")
 			took := time.Since(beforeRescore)
@@ -1362,6 +1426,47 @@ func (h *hnsw) knnSearchByVectorWithPool(ctx context.Context, searchVec []float3
 		}
 		took := time.Since(beforeRescore)
 		helpers.AnnotateSlowQueryLog(ctx, "knn_search_rescore_took", took)
+	}
+
+	if stats != nil && !h.multivector.Load() {
+		// Deterministic ranked list for the pool path: heap pops break
+		// distance ties in arbitrary order, which would leak capture order
+		// into downstream per-tie decisions (the HFresh coverage claims).
+		// Drain the beam, add the captured discards, and order everything
+		// by (distance, id) before the poolK cut.
+		items := make([]poolItem, 0, res.Len()+len(captured))
+		for res.Len() > 0 {
+			it := res.Pop()
+			items = append(items, poolItem{id: it.ID, dist: it.Dist})
+		}
+		for _, item := range captured {
+			// tombstone backstop, same as the rescoring merge above
+			if h.hasTombstone(item.id) {
+				continue
+			}
+			items = append(items, item)
+		}
+		slices.SortFunc(items, func(a, b poolItem) int {
+			if b.worseThan(a) {
+				return -1
+			}
+			if a.worseThan(b) {
+				return 1
+			}
+			return 0
+		})
+		if len(items) > poolK {
+			items = items[:poolK]
+		}
+		stats.PoolSize = len(items)
+		ids := make([]uint64, len(items))
+		dists := make([]float32, len(items))
+		for i, item := range items {
+			ids[i] = item.id
+			dists[i] = item.dist
+		}
+		h.pools.pqResults.Put(res)
+		return ids, dists, nil
 	}
 
 	if !h.multivector.Load() {

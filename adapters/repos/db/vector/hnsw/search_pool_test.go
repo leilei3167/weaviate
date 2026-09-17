@@ -181,10 +181,14 @@ func TestSearchByVectorWithPoolEntrypointSeedDuplicate(t *testing.T) {
 // evaluated, WITHOUT touching the beam or its termination. Two properties
 // follow and are asserted here:
 //
-//  1. the first k pooled results are identical to a plain k-search (capture
-//     must not perturb the traversal), and
+//  1. the first k pooled results carry the same candidates and distances
+//     as a plain k-search (capture must not perturb the traversal); order
+//     may differ only within distance ties, where the pool path is
+//     deterministically id-ordered while the plain heap order is
+//     arbitrary, and
 //  2. the pool reaches beyond ef (the plain search could never return more
-//     than ef results), while staying sorted, deduplicated, and allowed.
+//     than ef results), while staying sorted — ties by ascending id —
+//     deduplicated, and allowed.
 func TestSearchByVectorWithPool(t *testing.T) {
 	const (
 		n       = 1000
@@ -199,8 +203,18 @@ func TestSearchByVectorWithPool(t *testing.T) {
 		poolK = 50
 	)
 
+	const (
+		// two allowed ids carry the query's exact vector: their distances
+		// are bit-identical (a deliberate tie) and rank first, so the
+		// (distance, id) tie-break is exercised at the top of the pool
+		tieLo = uint64(10)
+		tieHi = uint64(600)
+	)
+
 	ctx := context.Background()
 	vectors, queries := testinghelpers.RandomVecsFixedSeed(n, 1, 8)
+	vectors[tieLo] = append([]float32(nil), queries[0]...)
+	vectors[tieHi] = append([]float32(nil), queries[0]...)
 
 	index := newPoolTestIndex(t, ent.UserConfig{
 		MaxConnections:        16,
@@ -237,11 +251,19 @@ func TestSearchByVectorWithPool(t *testing.T) {
 	require.Positive(t, stats.DistanceComps)
 	require.True(t, stats.CaptureActive)
 
-	// (1) capture must not perturb the traversal: identical top-k
-	require.Equal(t, plainIDs, poolIDs[:k])
+	// (1) capture must not perturb the traversal: same top-k candidates
+	// with the same distances. Order may differ only within distance ties,
+	// where the pool path is deterministically id-ordered while the plain
+	// heap order is arbitrary.
+	require.ElementsMatch(t, plainIDs, poolIDs[:k])
 	require.Equal(t, plainDists, poolDists[:k])
 
-	// ranked, deduplicated, allowed
+	// the deliberate tie ranks first and must come out in id order
+	require.Equal(t, []uint64{tieLo, tieHi}, poolIDs[:2],
+		"bit-identical distances must be ordered by ascending id")
+	require.Equal(t, poolDists[0], poolDists[1])
+
+	// ranked (ties by ascending id), deduplicated, allowed
 	seen := make(map[uint64]bool, len(poolIDs))
 	for i, id := range poolIDs {
 		require.True(t, allowSet[id], "pooled id %d not in the allowlist", id)
@@ -249,6 +271,9 @@ func TestSearchByVectorWithPool(t *testing.T) {
 		seen[id] = true
 		if i > 0 {
 			require.GreaterOrEqual(t, poolDists[i], poolDists[i-1], "pool must be sorted by distance")
+			if poolDists[i] == poolDists[i-1] {
+				require.Greater(t, id, poolIDs[i-1], "distance ties must be ordered by ascending id")
+			}
 		}
 	}
 }
